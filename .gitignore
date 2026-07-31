@@ -1,3 +1,6 @@
 ﻿__pycache__/
 *.pyc
 *.fit
+dist/
+build/
+*.egg-info/

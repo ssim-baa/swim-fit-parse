@@ -16,7 +16,8 @@ Design constraints (Workout Schema Document v3.0, section A):
     splitting by course is the consumer's job (operating rule 14).
 
 Usage:
-    python fit_parse.py <FIT path...>
+    pip install swim-fit-parse
+    python -m swim_fit_parse <FIT path...>
 
 Multiple paths are assembled into one session (Stage 0) when they are
 adjacent in time; otherwise each group is reported separately.
@@ -34,8 +35,11 @@ try:
 except ImportError:  # pragma: no cover
     sys.exit("fitparse is required:  pip install fitparse")
 
-SCHEMA_VERSION = "3.1"
-PARSER_TAG = "v3.1"
+SCHEMA_VERSION = "3.2"
+PARSER_TAG = "v3.2"
+
+# block_metrics payload marker — see the emit site for why this is mandatory.
+BM_PREFIX = "bm1|"
 
 KST = timedelta(hours=9)
 
@@ -183,10 +187,22 @@ def coefficient_of_variation(values):
 
 
 def fade_pct(values):
-    """First rep vs last rep degradation, percent. Positive = slowed down."""
-    if len(values) < 2 or not values[0]:
+    """Second-half mean vs first-half mean, percent. Positive = slowed down.
+
+    Uses every rep, not just the endpoints: a first/last comparison discards
+    the interior (n=6 -> 4 values ignored) and lets a single fast opener or
+    slow closer dominate. With an odd n the middle rep is excluded from both
+    halves. Below n=4 there is no half to average, so fade is null.
+    """
+    n = len(values)
+    if n < 4:
         return None
-    return round((values[-1] - values[0]) / values[0] * 100, 1)
+    half = n // 2
+    first = statistics.fmean(values[:half])
+    second = statistics.fmean(values[-half:])
+    if not first:
+        return None
+    return round((second / first - 1) * 100, 1)
 
 
 # --------------------------------------------------------------------------
@@ -323,7 +339,16 @@ def group_blocks(laps, has_workout):
 
 def hrr_60(laps, idx, hr_series):
     """Operating rule 13: only when the following rest is >=60s AND no active
-    lap starts within 60s. Otherwise null — never 0."""
+    lap starts within 60s. Otherwise null — never 0.
+
+    Applies to the BLOCK's final rep (see build_block_metrics): evaluating
+    every rep and taking the max lets one qualifying rep fill a block whose
+    recovery window never existed.
+    """
+    # The last active lap of the session has no following rest window — the
+    # trailing idle is session teardown, not recovery between efforts.
+    if not any(l["is_active"] for l in laps[idx + 1:]):
+        return None
     rest = rest_after(laps, idx)
     if rest is None or rest < HRR_MIN_REST_S:
         return None
@@ -369,8 +394,21 @@ def build_block_metrics(laps, has_workout, hr_series, steps):
         sig_rest = round(rest_med / 5) * 5 if rest_med else None
 
         step_idx = key[1] if key[0] == "step" else None
-        hrrs = [h for h in (hrr_60(laps, i, hr_series) for i in idxs)
-                if h is not None]
+        # Operating rule 13 is a BLOCK condition: evaluate the recovery window
+        # that follows the block's final rep, not every rep with a max().
+        block_hrr = hrr_60(laps, idxs[-1], hr_series)
+        # The window the gate actually evaluated — distinct from
+        # rest_median_s (which is rest BETWEEN reps). Emitting it makes an
+        # hrr_60 value auditable instead of having to trust the gate.
+        hrr_rest = rest_after(laps, idxs[-1])
+        if not any(l["is_active"] for l in laps[idxs[-1] + 1:]):
+            hrr_rest = None
+
+        # Garmin does not count strokes on drill lengths, so total_cycles==0
+        # means NOT MEASURED, not "zero strokes". Emitting 0 (or a swolf that
+        # is really just lap time) would poison downstream averages.
+        measured = cycles > 0
+        swolfs = [l["dswolf"] for l in reps if l["dswolf"]] if measured else []
 
         out.append({
             "signature": signature(statistics.median(dists), reps[0]["stroke"],
@@ -383,17 +421,17 @@ def build_block_metrics(laps, has_workout, hr_series, steps):
             "pace_median": round(statistics.median(paces), 1) if paces else None,
             "cv": coefficient_of_variation(paces),
             "fade": fade_pct(paces),
-            "dps_m": round(dist_total / cycles, 2) if cycles else None,
-            "cycles_per_length": round(cycles / act_len, 2) if act_len else None,
-            "swolf": round(statistics.median(
-                [l["dswolf"] for l in reps if l["dswolf"]]), 1)
-                if any(l["dswolf"] for l in reps) else None,
+            "dps_m": round(dist_total / cycles, 2) if measured else None,
+            "cycles_per_length": (round(cycles / act_len, 2)
+                                  if measured and act_len else None),
+            "swolf": round(statistics.median(swolfs), 1) if swolfs else None,
             "spi": round(dist_total / cycles / (statistics.median(paces) / 100), 3)
-                if cycles and paces and statistics.median(paces) else None,
+                if measured and paces and statistics.median(paces) else None,
             "rest_median_s": round(rest_med) if rest_med else None,
             "avg_hr": round(statistics.fmean(hrs)) if hrs else None,
             "peak_hr": max((l["max_hr"] for l in reps if l["max_hr"]), default=None),
-            "hrr_60": max(hrrs) if hrrs else None,
+            "hrr_60": block_hrr,
+            "hrr_rest_s": round(hrr_rest) if hrr_rest else None,
         })
     return out
 
@@ -880,8 +918,15 @@ def render(group, merges=None, drops=None):
     lines.append("### block_metrics (L3 적재용 JSON)")
     # One block per line, compact separators: readable enough to eyeball while
     # keeping the payload near the section A context budget (~450 tokens).
-    lines.append("```json")
-    lines.append("[")
+    # `bm1|` prefix is REQUIRED, not cosmetic: the Notion MCP connector
+    # pre-parses text property values as JSON and rejects a top-level array
+    # outright. The marker breaks that parse so the string is stored verbatim.
+    # Consumer: value.split("|", 1)[1] then json.loads.
+    # bm1 = payload schema version; bump to bm2 if the block shape changes.
+    # (JSONL was rejected: a single-block session yields one line that is
+    #  itself a valid JSON object, hitting the same refusal.)
+    lines.append("```")
+    lines.append(BM_PREFIX + "[")
     for i, b in enumerate(blocks):
         comma = "," if i < len(blocks) - 1 else ""
         lines.append(json.dumps(b, ensure_ascii=False,
@@ -1012,6 +1057,13 @@ def apply_merges(laps, pairs):
 
 
 def main(argv):
+    # Output carries Korean text and typographic marks; a Windows console
+    # defaults to cp949 and dies on them. Force UTF-8 rather than mangling.
+    try:
+        sys.stdout.reconfigure(encoding="utf-8")
+    except (AttributeError, ValueError):
+        pass
+
     merge_spec = None
     drop_spec = None
     paths = []
@@ -1049,6 +1101,11 @@ def main(argv):
         if i:
             print("\n" + "=" * 72 + "\n")
         print(render(group, merges, drops))
+
+
+def _cli():
+    """console_scripts entry point."""
+    main(sys.argv[1:])
 
 
 if __name__ == "__main__":

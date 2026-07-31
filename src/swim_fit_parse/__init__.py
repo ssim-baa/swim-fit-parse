@@ -35,8 +35,8 @@ try:
 except ImportError:  # pragma: no cover
     sys.exit("fitparse is required:  pip install fitparse")
 
-SCHEMA_VERSION = "3.2"
-PARSER_TAG = "v3.2"
+SCHEMA_VERSION = "3.3"
+PARSER_TAG = "v3.3"
 
 # block_metrics payload marker — see the emit site for why this is mandatory.
 BM_PREFIX = "bm1|"
@@ -815,7 +815,14 @@ def render(group, merges=None, drops=None):
              if f["session"].get("avg_temperature") is not None]
     temp = round(statistics.fmean(temps), 1) if temps else None
 
-    pace100 = pace_per_100m(total_time, total_dist)
+    # Pace and SWOLF are swimming metrics: the numerator is time SPENT
+    # SWIMMING, not elapsed session time. Using total_time (which includes
+    # rest laps) inflates pace by roughly the rest fraction — 05-23 read
+    # 177 s/100m against an actual 118 — and that error propagates into
+    # hr_efficiency, which divides by pace.
+    active_time = sum(l["secs"] for l in laps
+                      if l["is_active"] and not l["phantom"])
+    pace100 = pace_per_100m(active_time, total_dist)
 
     lines = []
     lines.append(f"schema_version: {SCHEMA_VERSION} | parser_tag: {PARSER_TAG}")
@@ -846,9 +853,13 @@ def render(group, merges=None, drops=None):
                      f"{len(phantoms)}건 {int(garmin_dist - total_dist)}m)")
     else:
         lines.append(f"- total_distance_m: {int(total_dist)}")
-    lines.append(f"- duration_min: {round(total_time / 60, 1)}")
+    lines.append(f"- duration_min: {round(total_time / 60, 1)}  "
+                 f"(경과 · 휴식 포함) | active_min: {round(active_time / 60, 1)}")
     lines.append(f"- avg_pace_per_100m: {round(pace100)}  ({fmt_pace(pace100)})"
                  if pace100 else "- avg_pace_per_100m: -")
+    sess_swolf = derived_swolf(active_time, total_cycles, act_lengths)
+    lines.append(f"- avg_swolf: {round(sess_swolf, 1)}" if sess_swolf
+                 else "- avg_swolf: -")
     lines.append(f"- total_cycles: {total_cycles} | num_active_lengths: {act_lengths}")
     lines.append(f"- cycles_per_length: "
                  f"{round(total_cycles / act_lengths, 2) if act_lengths else '-'}")

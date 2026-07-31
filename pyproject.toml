@@ -4,7 +4,7 @@ build-backend = "hatchling.build"
 
 [project]
 name = "swim-fit-parse"
-version = "3.2"
+version = "3.3"
 description = "Deterministic Garmin lap-swimming .FIT parser — session/lap/block metrics with length-level anomaly detection"
 readme = "README.md"
 requires-python = ">=3.9"

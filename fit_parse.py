@@ -34,8 +34,8 @@ try:
 except ImportError:  # pragma: no cover
     sys.exit("fitparse is required:  pip install fitparse")
 
-SCHEMA_VERSION = "3.0"
-PARSER_TAG = "v3.0"
+SCHEMA_VERSION = "3.1"
+PARSER_TAG = "v3.1"
 
 KST = timedelta(hours=9)
 

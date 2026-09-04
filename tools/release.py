@@ -100,9 +100,21 @@ def preflight(env, run_tests=True):
     tag = "v" + str(version)
     rc, head = run(["git", "rev-parse", "HEAD"])
     rc2, tagged = run(["git", "rev-list", "-n", "1", tag])
-    check(f"태그 {tag}가 HEAD를 가리킨다",
-          rc == 0 and rc2 == 0 and head.strip() == tagged.strip(),
-          f"HEAD {head.strip()[:8]} / {tag} {tagged.strip()[:8]}")
+    check(f"태그 {tag}가 존재한다", rc2 == 0, tagged.strip()[:60])
+    # HEAD가 태그를 지나쳐도 되지만, **패키지에 들어가는 내용**은 태그와
+    # 같아야 한다. 올라간 배포본이 태그와 다르면 "그 태그를 받아 재현한다"가
+    # 성립하지 않는다. `tools/`처럼 wheel에 없는 경로는 달라도 무방하다 —
+    # 그래서 커밋 해시가 아니라 경로별 diff로 본다.
+    if rc2 == 0:
+        packaged = ["src", "pyproject.toml", "README.md", "LICENSE"]
+        rcd, outd = run(["git", "diff", "--name-only", tag, "HEAD", "--"]
+                        + packaged)
+        same = head.strip() == tagged.strip()
+        check(f"패키지 내용이 태그 {tag}와 동일하다",
+              rcd == 0 and not outd.strip(),
+              ("HEAD가 태그를 지나쳤고 " + ", ".join(outd.split())
+               + " 가 바뀌었다 — 태그를 옮기거나 버전을 올려라")
+              if outd.strip() else ("HEAD == 태그" if same else "태그 이후 변경 없음"))
 
     rc, out = run(["git", "ls-remote", "--tags", "origin", tag])
     # 원격 조회는 네트워크가 필요하다. 실패는 경고로만 남긴다 — 태그 push는

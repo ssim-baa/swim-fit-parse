@@ -35,8 +35,8 @@ try:
 except ImportError:  # pragma: no cover
     sys.exit("fitparse is required:  pip install fitparse")
 
-SCHEMA_VERSION = "3.3"
-PARSER_TAG = "v3.3"
+SCHEMA_VERSION = "3.4"
+PARSER_TAG = "v3.4"
 
 # block_metrics payload marker — see the emit site for why this is mandatory.
 BM_PREFIX = "bm1|"
@@ -51,7 +51,7 @@ SESSION_GAP_LIMIT_S = 3 * 3600
 # The PRIMARY index is total_strokes, not time: pausing mid-length corrupts
 # duration but never stroke count, and that is exactly where a time-based
 # test fails. Time ratio is retained as a secondary/diagnostic figure.
-F1_STROKE_LOW = 0.65      # strokes below this fraction of group median -> candidate
+F1_STROKE_LOW = 0.65      # strokes below this fraction of the baseline -> candidate
 F1_RESTORE_LOW = 0.75     # adjacent candidates summed must land in this band
 F1_RESTORE_HIGH = 1.25    # to be confirmed as a split artifact
 
@@ -65,7 +65,9 @@ F3_STROKE_HIGH = 1.25     # -> distance is CORRECT, do not merge
 # Group key = (file, wkt_step_index); free sessions use (file, swim_stroke).
 # wkt_step_index is unique only within a file, so a multi-file session must not
 # pool across sources. Below the minimum size the median is not a population
-# statistic — report "평가 불가" rather than staying silent.
+# statistic — report "평가 불가" rather than staying silent. (The v3.4 design
+# anchor needs no population at all, so this floor could be relaxed for
+# anchored groups; deferred, the regression surface is wider than it looks.)
 F_MIN_GROUP = 5
 
 SWOLF_TOLERANCE = 1.0          # |garmin - derived| > 1 -> cross-check flag

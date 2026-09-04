@@ -14,7 +14,13 @@ PyPI는 같은 버전을 두 번 올릴 수 없어 **버전이 어긋난 채 올
     python tools/release.py                # 점검 + 빌드 (업로드 안 함)
     python tools/release.py --check        # 점검만
     python tools/release.py --upload       # 점검 + 빌드 + PyPI 업로드
+    python tools/release.py --from-tag     # 태그 커밋에서 빌드(작업 트리 무시)
     python tools/release.py --upload --repository testpypi
+
+**`--from-tag`가 태그와 배포본을 어긋나지 않게 하는 정공법이다.** 태그 이후
+`tools/`나 README를 손대도 배포본은 태그 그대로가 된다 — 임시 worktree에
+태그를 꺼내 거기서 빌드하고, 산출물만 `dist/`로 받는다. 태그를 옮기는(force
+push) 선택지를 쓰지 않아도 되는 이유다.
 
 자격 증명은 `.env`에서 읽는다(`env.example` 참조). **토큰 값은 어디에도
 출력하지 않는다** — 존재 여부와 형식만 확인한다.
@@ -28,6 +34,7 @@ import os
 import re
 import subprocess
 import sys
+import tempfile
 
 sys.stdout.reconfigure(encoding="utf-8", errors="replace")
 
@@ -83,7 +90,7 @@ def declared_versions():
             schema.group(1) if schema else None)
 
 
-def preflight(env, run_tests=True):
+def preflight(env, run_tests=True, from_tag=False, need_token=True):
     version, parser_tag, schema = declared_versions()
     print(f"[버전] pyproject {version} · PARSER_TAG {parser_tag} · "
           f"schema_version {schema}")
@@ -94,8 +101,12 @@ def preflight(env, run_tests=True):
           f"{version} / {parser_tag} / {schema}")
 
     rc, out = run(["git", "status", "--porcelain"])
-    check("작업 트리가 깨끗하다", rc == 0 and not out.strip(),
-          out.strip().splitlines()[:3])
+    if from_tag and out.strip():
+        print("  info  작업 트리에 변경이 있으나 --from-tag이므로 빌드에 들어가지 "
+              "않는다 — " + ", ".join(out.split()[-3:]))
+    else:
+        check("작업 트리가 깨끗하다", rc == 0 and not out.strip(),
+              out.strip().splitlines()[:3])
 
     tag = "v" + str(version)
     rc, head = run(["git", "rev-parse", "HEAD"])
@@ -110,11 +121,17 @@ def preflight(env, run_tests=True):
         rcd, outd = run(["git", "diff", "--name-only", tag, "HEAD", "--"]
                         + packaged)
         same = head.strip() == tagged.strip()
-        check(f"패키지 내용이 태그 {tag}와 동일하다",
-              rcd == 0 and not outd.strip(),
-              ("HEAD가 태그를 지나쳤고 " + ", ".join(outd.split())
-               + " 가 바뀌었다 — 태그를 옮기거나 버전을 올려라")
-              if outd.strip() else ("HEAD == 태그" if same else "태그 이후 변경 없음"))
+        if from_tag and outd.strip():
+            # --from-tag는 태그를 꺼내 빌드하므로 작업 트리와 달라도 무방하다.
+            # 다만 침묵하지는 않는다 — 무엇이 배포본에 빠지는지 이름을 찍는다.
+            print("  info  태그 이후 " + ", ".join(outd.split())
+                  + " 가 바뀌었다 — --from-tag이므로 배포본에는 반영되지 않는다")
+        else:
+            check(f"패키지 내용이 태그 {tag}와 동일하다",
+                  rcd == 0 and not outd.strip(),
+                  ("HEAD가 태그를 지나쳤고 " + ", ".join(outd.split())
+                   + " 가 바뀌었다 — 태그를 옮기거나 --from-tag로 빌드하라")
+                  if outd.strip() else ("HEAD == 태그" if same else "태그 이후 변경 없음"))
 
     rc, out = run(["git", "ls-remote", "--tags", "origin", tag])
     # 원격 조회는 네트워크가 필요하다. 실패는 경고로만 남긴다 — 태그 push는
@@ -126,8 +143,14 @@ def preflight(env, run_tests=True):
               "push 후 배포하라: git push origin " + tag)
 
     token = env.get("TWINE_PASSWORD", "")
-    check(".env에 TWINE_PASSWORD가 있다", bool(token),
-          "env.example을 복사해 .env를 만들고 토큰을 넣어라")
+    if need_token:
+        check(".env에 TWINE_PASSWORD가 있다", bool(token),
+              "env.example을 복사해 .env를 만들고 토큰을 넣어라")
+    elif not token:
+        # 업로드하지 않는 실행에서 토큰 부재는 결함이 아니다. 빌드까지는
+        # 자격 증명이 필요 없으므로 막지 않되, 상태는 알려 준다.
+        print("  info  .env에 토큰이 없다 — 빌드까지는 필요 없다"
+              " (업로드하려면 env.example 참조)")
     if token:
         # 값은 절대 찍지 않는다. 형식만 본다.
         check("토큰이 PyPI API 토큰 형식이다", token.startswith("pypi-"),
@@ -146,20 +169,42 @@ def preflight(env, run_tests=True):
     return version
 
 
-def build(version):
-    if not os.path.exists(os.path.join(REPO, "dist")):
-        os.makedirs(os.path.join(REPO, "dist"))
+def build(version, from_tag=False):
+    dist = os.path.join(REPO, "dist")
+    if not os.path.exists(dist):
+        os.makedirs(dist)
     rc, out = run([sys.executable, "-c", "import build"])
     if rc != 0:
         print("  FAIL  `build` 패키지가 없다 — pip install build")
         FAILURES.append("build 패키지")
         return []
-    print("[빌드] python -m build")
-    rc, out = run([sys.executable, "-m", "build"])
-    if rc != 0:
-        print(out[-2000:])
-        FAILURES.append("빌드")
-        return []
+    if from_tag:
+        tag = "v" + str(version)
+        work = os.path.join(tempfile.gettempdir(),
+                            f"swim-fit-parse-{tag}-build")
+        run(["git", "worktree", "remove", "--force", work])
+        rc, out = run(["git", "worktree", "add", "--detach", work, tag])
+        if rc != 0:
+            print(out[-1000:])
+            FAILURES.append("worktree")
+            return []
+        print(f"[빌드] {tag} 태그 worktree — {work}")
+        p = subprocess.run([sys.executable, "-m", "build", "--outdir", dist],
+                           cwd=work, capture_output=True, text=True,
+                           encoding="utf-8", errors="replace")
+        rc, out = p.returncode, (p.stdout or "") + (p.stderr or "")
+        run(["git", "worktree", "remove", "--force", work])
+        if rc != 0:
+            print(out[-2000:])
+            FAILURES.append("빌드")
+            return []
+    else:
+        print("[빌드] python -m build")
+        rc, out = run([sys.executable, "-m", "build"])
+        if rc != 0:
+            print(out[-2000:])
+            FAILURES.append("빌드")
+            return []
     made = [f for f in sorted(os.listdir(os.path.join(REPO, "dist")))
             if version in f]
     for f in made:
@@ -194,11 +239,14 @@ def main(argv=None):
     ap.add_argument("--repository", help="twine --repository (예: testpypi)")
     ap.add_argument("--skip-tests", action="store_true",
                     help="점검에서 테스트 실행을 뺀다")
+    ap.add_argument("--from-tag", action="store_true",
+                    help="작업 트리가 아니라 태그 커밋에서 빌드한다")
     a = ap.parse_args(argv)
 
     env = load_env(ENV_PATH)
     print(f"[.env] {'읽음' if env else '없음'} — {ENV_PATH}")
-    version = preflight(env, run_tests=not a.skip_tests)
+    version = preflight(env, run_tests=not a.skip_tests,
+                        from_tag=a.from_tag, need_token=a.upload)
     if FAILURES:
         print()
         print(f"점검 실패 {len(FAILURES)}건: {', '.join(FAILURES)}")
@@ -207,7 +255,7 @@ def main(argv=None):
 
     if a.check:
         return 0
-    made = build(version)
+    made = build(version, from_tag=a.from_tag)
     if FAILURES:
         return 1
     if not a.upload:

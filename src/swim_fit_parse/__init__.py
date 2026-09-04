@@ -460,6 +460,23 @@ def collect_flags(laps, lengths, steps, blocks, pool_length=None):
     """
     flags = []
 
+    # --- repetition counts from the workout program ------------------------
+    # FIT puts the count on a SEPARATE repeat step, not on the swim step the
+    # laps point at: duration_step=6 with repeat_steps=4 means "repeat steps
+    # 6..7, four times". Measured against 09-03 — `repeat_value`, which F5
+    # read until v3.4, does not exist in these files at all.
+    repeats = {}
+    for st in steps.values():
+        if st.get("duration_type") != "repeat_until_steps_cmplt":
+            continue
+        start = st.get("duration_step")
+        cnt = st.get("repeat_steps")
+        here = st.get("message_index")
+        if not all(isinstance(v, int) for v in (start, cnt, here)) or cnt < 1:
+            continue
+        for i in range(start, here):        # nested repeats multiply
+            repeats[i] = repeats.get(i, 1) * cnt
+
     # --- group the active lengths -----------------------------------------
     # Key = (file, wkt_step_index), or (file, swim_stroke) for free sessions.
     groups = {}
@@ -476,6 +493,18 @@ def collect_flags(laps, lengths, steps, blocks, pool_length=None):
         strokes = [l["strokes"] for l in group if l["strokes"]]
         times = [l["secs"] for l in group if l["secs"]]
 
+        # How many lengths the program CALLS FOR: distance per rep / pool
+        # length, times the repeat count. Design, not observation — it holds
+        # even when the observed population is polluted.
+        designed_per_lap = None
+        designed_total = None
+        if key[0] == "step" and pool_length:
+            st = steps.get(key[2])
+            dd = st.get("duration_distance") if st else None
+            if dd:
+                designed_per_lap = dd / pool_length
+                designed_total = designed_per_lap * repeats.get(key[2], 1)
+
         # Undersized groups are reported, not silently skipped: silence would
         # read as "checked and clean".
         if len(strokes) < F_MIN_GROUP or len(times) < F_MIN_GROUP:
@@ -490,15 +519,40 @@ def collect_flags(laps, lengths, steps, blocks, pool_length=None):
             })
             continue
 
-        s_med = statistics.median(strokes)
-        t_med = statistics.median(times)
-        if not s_med or not t_med:
+        # The median collapses once fabricated lengths are a large share of
+        # the population (09-03 step6: median 10 against a real band near 20)
+        # and that fails the detectors BOTH ways — F1 misses real fragments
+        # while F2 fires on normal ones. Total strokes, by contrast, are
+        # INVARIANT under a length boundary error: splitting or merging
+        # lengths does not change how many times the arm turned over. So
+        # total / designed count is the per-length truth. Applied only when
+        # the design is known AND the group is over-populated (E > 0);
+        # otherwise the median is more robust against a genuine outlier.
+        #
+        # Both baselines move together on purpose. Anchoring strokes alone
+        # would drop 09-03 #19/#25 out of the F2 band straight into F3's
+        # normal-stroke band while their time ratio stayed inflated —
+        # trading a false F2 for a false F3. The cost is that a real pause
+        # (F3) lifts the time anchor, but it is divided across
+        # designed_total lengths while the offending length keeps the whole
+        # excess, so its ratio still rises.
+        s_base = statistics.median(strokes)
+        t_base = statistics.median(times)
+        base_note = "중앙값"
+        if designed_total and len(group) > designed_total:
+            s_base = sum(strokes) / designed_total
+            t_base = sum(times) / designed_total
+            base_note = (f"설계앵커 {sum(strokes)}÷{designed_total:g}, "
+                         f"E={len(group) - designed_total:+g}")
+        if not s_base or not t_base:
             continue
+        gnote = (f"| 그룹 {label}, n={len(strokes)}, "
+                 f"기준선 {s_base:.1f}({base_note})")
 
         # per-length ratios; strokes primary, duration secondary
         for ln in group:
-            ln["_sr"] = (ln["strokes"] / s_med) if ln["strokes"] else None
-            ln["_tr"] = (ln["secs"] / t_med) if ln["secs"] else None
+            ln["_sr"] = (ln["strokes"] / s_base) if ln["strokes"] else None
+            ln["_tr"] = (ln["secs"] / t_base) if ln["secs"] else None
 
         # --- F1 split artifact: strokes far below median ------------------
         # Confirmed when adjacent candidates' strokes sum back into 0.75~1.25:
@@ -515,27 +569,26 @@ def collect_flags(laps, lengths, steps, blocks, pool_length=None):
         # that C2 (adjacent-sum restoration) structurally cannot: a fragment
         # that was ADDED was never split, so nothing sums back.
         c1_laps = {}
-        if key[0] == "step" and pool_length:
-            step_c1 = steps.get(key[2])
-            dd_c1 = step_c1.get("duration_distance") if step_c1 else None
-            if dd_c1:
-                designed = dd_c1 / pool_length
-                per_lap = {}
-                for ln in candidates:
-                    per_lap.setdefault(ln["lap_n"], []).append(ln)
-                for lap_n, cands in per_lap.items():
-                    owner = next((l for l in laps if l["n"] == lap_n), None)
-                    if not owner:
-                        continue
-                    excess = owner["active_lengths"] - designed
-                    if excess > 0 and len(cands) == excess:
-                        c1_laps[lap_n] = {
-                            "excess": int(excess),
-                            "designed": int(designed),
-                            "observed": owner["active_lengths"],
-                            "cands": sorted(x["idx"] for x in cands),
-                            "dd": dd_c1,
-                        }
+        if designed_per_lap:
+            designed = designed_per_lap
+            per_lap = {}
+            for ln in candidates:
+                per_lap.setdefault(ln["lap_n"], []).append(ln)
+            for lap_n, cands in per_lap.items():
+                owner = next((l for l in laps if l["n"] == lap_n), None)
+                # A phantom lap is excluded from every aggregate; letting
+                # it ground a correction proposal would contradict that.
+                if not owner or owner["phantom"]:
+                    continue
+                excess = owner["active_lengths"] - designed
+                if excess > 0 and len(cands) == excess:
+                    c1_laps[lap_n] = {
+                        "excess": int(excess),
+                        "designed": int(designed),
+                        "observed": owner["active_lengths"],
+                        "cands": sorted(x["idx"] for x in cands),
+                        "dd": designed_per_lap * pool_length,
+                    }
         for ln in candidates:
             if ln["idx"] in consumed:
                 continue
@@ -546,7 +599,7 @@ def collect_flags(laps, lengths, steps, blocks, pool_length=None):
                 run.append(next(x for x in candidates if x["idx"] == nxt))
                 nxt += 1
             total = sum(x["strokes"] for x in run)
-            restored = total / s_med
+            restored = total / s_base
             c1 = c1_laps.get(run[0]["lap_n"])
             # C1 wins when it covers this run: it is the superset test.
             c1_covers = bool(c1 and set(x["idx"] for x in run) <= set(c1["cands"]))
@@ -617,11 +670,11 @@ def collect_flags(laps, lengths, steps, blocks, pool_length=None):
                 "lap_n": run[0]["lap_n"],
                 "detail": (
                     f"length {idxs} strokes {stroke_terms}={total} / "
-                    f"그룹 중앙값 {s_med:.0f} = "
+                    f"기준선 {s_base:.1f} = "
                     f"{'합산 ' if len(run) > 1 else ''}비율 {restored:.2f}"
                     + (f" (개별 {indiv})" if len(run) > 1 else "")
                     + f" | 시간 비율 {time_terms} (보조지표) "
-                    f"| 그룹 {label}, n={len(strokes)}"),
+                    + gnote),
                 "suggest": (
                     f"분할 확정 — 랩 {lap_list} 거리 과대 기록 상태"
                     if confirmed else
@@ -643,8 +696,7 @@ def collect_flags(laps, lengths, steps, blocks, pool_length=None):
                     "detail": (f"length#{ln['idx']} strokes {ln['strokes']} "
                                f"= 비율 {ln['_sr']:.2f} (≥{F2_STROKE_HIGH}) | "
                                f"시간 {ln['secs']:.1f}초 = 비율 {ln['_tr']:.2f} "
-                               f"(≥{F2_DURATION_HIGH}) | 그룹 {label}, "
-                               f"n={len(strokes)}"),
+                               f"(≥{F2_DURATION_HIGH}) " + gnote),
                     "suggest": "length 2개가 1개로 기록 — 거리 과소 기록 상태. 분할 검토",
                 })
 
@@ -665,8 +717,7 @@ def collect_flags(laps, lengths, steps, blocks, pool_length=None):
                                f"= 비율 {ln['_tr']:.2f} (≥{F3_DURATION_HIGH}) "
                                f"이나 strokes {ln['strokes']} = 비율 "
                                f"{ln['_sr']:.2f} (정상 {F3_STROKE_LOW}~"
-                               f"{F3_STROKE_HIGH}) | 그룹 {label}, "
-                               f"n={len(strokes)}"),
+                               f"{F3_STROKE_HIGH}) " + gnote),
                     "suggest": ("**병합 금지 — 거리 정확**. 제자리 정지 추정. "
                                 "페이스·SWOLF 산출에서만 제외"),
                 })

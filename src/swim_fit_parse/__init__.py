@@ -746,26 +746,46 @@ def collect_flags(laps, lengths, steps, blocks, pool_length=None):
                 "suggest": "영법 오검출 또는 실행 이탈 — 확인 필요",
             })
 
-    # --- F5: structural mismatch vs workout_step repeat count -------------
-    counts = {}
-    for lap in laps:
-        if lap["is_active"] and lap["step_idx"] is not None:
-            counts[lap["step_idx"]] = counts.get(lap["step_idx"], 0) + 1
-    for step_idx, actual in sorted(counts.items()):
-        step = steps.get(step_idx)
-        if not step:
+    # --- F5: structural mismatch vs the programmed length count -----------
+    # v3.4 moves the comparison from laps to lengths. Detection and
+    # correction both operate on lengths (Schema v3.1, "검출 단위와 조작
+    # 단위 일치"); F5 was the last rule left counting laps, and a lap count
+    # is blind to the failure that matters — 09-03 step6 ran its 4 laps
+    # exactly as designed while carrying 7 lengths against a designed 4.
+    #
+    # It also read `repeat_value` off the swim step, a field these files do
+    # not carry at all, so F5 never fired in any session. Its silence was
+    # never evidence of a match.
+    #
+    # Deliberately reuses `groups`: E printed here and E printed in the
+    # F1~F3 baseline note must be the same number, or the group note and
+    # the structural verdict would contradict each other.
+    for key, group in sorted(groups.items(), key=lambda kv: str(kv[0])):
+        if key[0] != "step" or not pool_length:
             continue
-        expected = step.get("repeat_value")
-        if isinstance(expected, int) and expected and actual != expected:
-            flags.append({
-                "type": "F5",
-                "title": "구조 불일치",
-                "length_idx": None,
-                "lap_n": None,
-                "detail": (f"step {step_idx} 실측 {actual}본 ≠ "
-                           f"workout_step.repeat_value {expected}본"),
-                "suggest": "본수 차이 — 실행 이탈 또는 랩 분할 확인",
-            })
+        st = steps.get(key[2])
+        dd = st.get("duration_distance") if st else None
+        if not dd:
+            continue
+        reps = repeats.get(key[2], 1)
+        expected = dd / pool_length * reps
+        actual = len(group)
+        if not expected or actual == expected:
+            continue
+        flags.append({
+            "type": "F5",
+            "title": "구조 불일치",
+            "length_idx": None,
+            "lap_n": None,
+            "detail": (f"step {key[2]} 실측 active length {actual}개 ≠ "
+                       f"설계 {expected:g}개 ({dd:.0f}m ÷ "
+                       f"{pool_length:.0f}m × {reps}회) — "
+                       f"E={actual - expected:+g}"),
+            "suggest": ("초과 — 유령 length 추정. F1 제안 인자 개수가 E와 "
+                        "일치하는지 대조하라"
+                        if actual > expected else
+                        "부족 — 실행 이탈 또는 턴 미검출(F2) 확인"),
+        })
 
     # --- F6: unassigned laps (informational, not an error) ----------------
     unassigned = [l["n"] for l in laps if l["is_active"] and l["step_idx"] is None]

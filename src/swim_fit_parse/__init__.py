@@ -446,6 +446,21 @@ def build_block_metrics(laps, has_workout, hr_series, steps):
 # flags
 # --------------------------------------------------------------------------
 
+def declared_stroke(steps, step_idx):
+    """The stroke a workout step programs, or None.
+
+    Garmin stores it in target_stroke_type, not target_value (confirmed
+    against the 07-18 workout_step dump). The value can be a raw enum the
+    watch never resolved (255 on the 09-03 cooldown); it is returned as-is
+    so F4 keeps reporting the mismatch, and it simply never matches a
+    measured stroke name when used to pick a host.
+    """
+    step = steps.get(step_idx) if step_idx is not None else None
+    if not step or step.get("target_type") != "swim_stroke":
+        return None
+    return step.get("target_stroke_type")
+
+
 def collect_flags(laps, lengths, steps, blocks, pool_length=None):
     """v3.0 detection rules F1~F4 (Schema: 병합 서브루틴 절).
 
@@ -632,7 +647,20 @@ def collect_flags(laps, lengths, steps, blocks, pool_length=None):
                     f"length, 초과 E={c1['excess']} = 후보 수 "
                     f"{len(c1['cands'])} 일치 ✅")
             elif c2_ok:
-                drop_idx = [x["idx"] for x in run[1:]]
+                # Which fragment survives is a stroke verdict, not
+                # bookkeeping: apply_drops folds the others into it and the
+                # lap takes its stroke as the label, which then decides
+                # block grouping. Prefer the fragment matching what the step
+                # programmed; fall back to the leading one. A wrong pick
+                # still surfaces as F4, so the user keeps the chance to flip
+                # the argument at the GATE.
+                declared = (declared_stroke(steps, key[2])
+                            if key[0] == "step" else None)
+                host = run[0]
+                if declared:
+                    host = next((x for x in run
+                                 if x["stroke"] == declared), run[0])
+                drop_idx = [x["idx"] for x in run if x["idx"] != host["idx"]]
                 proposal = "--drop-lengths " + ",".join(
                     str(d) for d in drop_idx)
                 # Second evidence line: does the corrected lap distance match
@@ -729,10 +757,7 @@ def collect_flags(laps, lengths, steps, blocks, pool_length=None):
         step = steps.get(ln["step_idx"])
         if not step:
             continue
-        # Garmin stores the declared stroke in target_stroke_type, not
-        # target_value (confirmed against 07-18 workout_step dump).
-        declared = (step.get("target_stroke_type")
-                    if step.get("target_type") == "swim_stroke" else None)
+        declared = declared_stroke(steps, ln["step_idx"])
         if declared and ln["stroke"] and declared != ln["stroke"]:
             flags.append({
                 "type": "F4",

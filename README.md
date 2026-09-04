@@ -147,6 +147,38 @@ SWOLF는 length당 (시간 + 스트로크)이므로 시간도 함께 빠지고, 
   게이트가 평가한 실제 휴식 길이는 `hrr_rest_s`로 함께 방출되어 감사
   가능하다 — rep **사이** 휴식인 `rest_median_s`와는 다른 값이다.
 
+## 배포 (메인테이너용)
+
+자격 증명은 `.env`에 두고 `tools/release.py`가 읽는다. **토큰은 화면에도
+명령줄에도 나오지 않는다** — twine에 환경변수로만 넘긴다(명령줄에 실으면
+프로세스 목록과 셸 이력에 남는다).
+
+```bash
+cp env.example .env        # 그리고 PyPI 토큰을 붙여넣는다
+pip install build          # 최초 1회
+
+python tools/release.py --check     # 점검만
+python tools/release.py             # 점검 + 빌드
+python tools/release.py --upload    # 점검 + 빌드 + 업로드
+```
+
+`.env`와 `.env.*`는 `.gitignore`에 있다. 템플릿 파일명이 `env.example`인
+이유가 그것이다 — `.env.example`은 같은 규칙에 걸려 저장소에서 사라진다.
+
+**점검이 이 스크립트의 본체다.** PyPI는 같은 버전을 두 번 올릴 수 없으므로
+버전이 어긋난 채 올라가면 되돌릴 수 없고, 이 패키지는 계약 버전이 세 곳
+(`pyproject.toml` · `PARSER_TAG` · git 태그)에 나뉘어 있으며 P1 세션의 스탬프
+GATE가 **PyPI 설치본의 출력**과 Notion 미러를 대조한다. 점검 항목:
+
+- `pyproject`·`PARSER_TAG`·`schema_version` 세 문자열 일치
+- 작업 트리 clean · 태그 `v<version>`이 HEAD를 가리킴 · 원격에 태그 존재
+- `.env`에 토큰이 있고 `pypi-` 형식이며 **git에 추적되지 않음**
+- `tests/test_v34.py`·`tests/test_v35.py` 통과
+
+배포 후 순서 — **Notion Workflow preconditions의 파서 버전 미러를 마지막에
+갱신한다.** 미러를 먼저 올리면 PyPI 이전 버전을 설치한 세션의 스탬프 GATE가
+불일치로 걸린다.
+
 ## 설계 원칙
 
 파서는 결정론적 추출만 한다. 판정하지 않고, 개인 상수(연령·체중·기준

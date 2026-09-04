@@ -226,8 +226,14 @@ def build_laps(group):
             n_len = d.get("num_lengths")
             window = []
             if first is not None and n_len:
+                # `or -1` here silently dropped message_index 0: index 0 is
+                # falsy, so the FIRST length of every session fell out of the
+                # detection population. Lap aggregates read the lap message
+                # directly and were unaffected, which is why this stayed
+                # invisible until the design anchor made group totals matter.
                 window = [x for x in lengths
-                          if first <= (x.get("message_index") or -1) < first + n_len]
+                          if x.get("message_index") is not None
+                          and first <= x["message_index"] < first + n_len]
             lap_lengths = [{
                 "idx": x.get("message_index"),
                 "secs": x.get("total_timer_time") or x.get("total_elapsed_time"),

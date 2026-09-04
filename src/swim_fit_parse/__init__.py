@@ -911,6 +911,11 @@ def render(group, merges=None, drops=None):
         lines.append(f"- merge_applied: true  (--drop-lengths {drop_note} — "
                      f"USER GATE 승인분, 거리 = 잔여 active length × "
                      f"{int(sess.get('pool_length') or 0)}m 자동 산출)")
+    relabeled = [l for l in laps if l.get("relabeled")]
+    if relabeled:
+        lines.append("- stroke_relabeled: " + ", ".join(
+            f"랩{l['n']} 혼합→{STROKE_KO.get(l['stroke'], l['stroke'])}"
+            for l in relabeled) + "  (교정 후 잔존 length 영법 단일)")
     if merge_note:
         lines.append(f"- merge_applied: true  (--merge {merge_note} — "
                      f"USER GATE 승인분, 폴백 경로)")
@@ -1084,6 +1089,22 @@ def apply_drops(laps, drop, pool_length):
         lap["dswolf"] = derived_swolf(lap["secs"], lap["cycles"],
                                       lap["active_lengths"])
         lap["dps"] = (lap["dist"] / lap["cycles"]) if lap["cycles"] else None
+
+        # The lap message's swim_stroke describes the PRE-correction
+        # composition. A lap whose ghost length was mis-detected as
+        # breaststroke reads "mixed", and it keeps reading "mixed" after the
+        # ghost is folded away — which splits one wkt_step across two blocks,
+        # since the block key carries stroke. Re-derive it from what is
+        # actually left.
+        #
+        # Corrected laps only. An untouched "mixed" lap is either a real
+        # medley or simply undetermined, and re-deriving those is a separate
+        # question with a much wider regression surface.
+        if lap.get("stroke") == "mixed":
+            survivors = {ln["stroke"] for ln in act if ln["stroke"]}
+            if len(survivors) == 1:
+                lap["stroke"] = survivors.pop()
+                lap["relabeled"] = True
     missing = drop - seen
     if missing:
         sys.exit(f"--drop-lengths: length {sorted(missing)} 없음")

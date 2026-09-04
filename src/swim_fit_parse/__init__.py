@@ -35,8 +35,8 @@ try:
 except ImportError:  # pragma: no cover
     sys.exit("fitparse is required:  pip install fitparse")
 
-SCHEMA_VERSION = "3.4"
-PARSER_TAG = "v3.4"
+SCHEMA_VERSION = "3.5"
+PARSER_TAG = "v3.5"
 
 # block_metrics payload marker — see the emit site for why this is mandatory.
 BM_PREFIX = "bm1|"
@@ -392,9 +392,16 @@ def build_block_metrics(laps, has_workout, hr_series, steps):
         paces = [l["pace100"] for l in reps if l["pace100"]]
         dists = [l["dist"] for l in reps]
         hrs = [l["avg_hr"] for l in reps if l["avg_hr"]]
-        cycles = sum(l["cycles"] for l in reps)
-        act_len = sum(l["active_lengths"] for l in reps)
+        # v3.5: 스트로크 파생 지표만 신뢰 length 기준으로 집계한다.
+        # `sc_*`는 --strokes-unreliable가 적용된 랩에만 존재하며, 없으면
+        # 원값으로 떨어진다 — 플래그를 쓰지 않은 세션의 출력은 불변이다.
+        cycles = sum(l.get("sc_cycles", l["cycles"]) for l in reps)
+        act_len = sum(l.get("sc_lengths", l["active_lengths"]) for l in reps)
         dist_total = sum(dists)
+        # dps_m·spi의 분자도 같은 모집단이어야 한다 — 스트로크를 뺀 length의
+        # 거리를 남기면 dps가 그만큼 부풀어 오른다. distance_m은 거리 필드이지
+        # 스트로크 파생이 아니므로 전량 유지한다(사양: 거리는 전량 포함).
+        sc_dist = sum(l.get("sc_dist", l["dist"]) for l in reps)
 
         rests = [r for r in (rest_after(laps, i) for i in idxs[:-1]) if r]
         rest_med = statistics.median(rests) if rests else None
@@ -429,11 +436,11 @@ def build_block_metrics(laps, has_workout, hr_series, steps):
             "pace_median": round(statistics.median(paces), 1) if paces else None,
             "cv": coefficient_of_variation(paces),
             "fade": fade_pct(paces),
-            "dps_m": round(dist_total / cycles, 2) if measured else None,
+            "dps_m": round(sc_dist / cycles, 2) if measured else None,
             "cycles_per_length": (round(cycles / act_len, 2)
                                   if measured and act_len else None),
             "swolf": round(statistics.median(swolfs), 1) if swolfs else None,
-            "spi": round(dist_total / cycles / (statistics.median(paces) / 100), 3)
+            "spi": round(sc_dist / cycles / (statistics.median(paces) / 100), 3)
                 if measured and paces and statistics.median(paces) else None,
             "rest_median_s": round(rest_med) if rest_med else None,
             "avg_hr": round(statistics.fmean(hrs)) if hrs else None,
@@ -849,7 +856,7 @@ def fmt_dur(seconds):
     return f"{seconds // 60}:{seconds % 60:02d}"
 
 
-def render(group, merges=None, drops=None):
+def render(group, merges=None, drops=None, unreliable=None):
     sess = {}
     for f in group:
         for k, v in f["session"].items():
@@ -894,6 +901,14 @@ def render(group, merges=None, drops=None):
     if merges:
         laps = apply_merges(laps, merges)
         merge_note = ", ".join("+".join(str(m) for m in p) for p in merges)
+    # 교정(length 제거·랩 병합) 다음에 온다. 신뢰도 표시는 값을 바꾸지 않으므로
+    # 마지막이어야 이미 확정된 랩 집계 위에서 제외분을 뺄 수 있다.
+    unreliable_detail = None
+    unreliable_note = None
+    if unreliable:
+        unreliable_detail = apply_strokes_unreliable(
+            laps, unreliable, sess.get("pool_length"))
+        unreliable_note = ",".join(str(i) for i in sorted(unreliable))
     blocks = build_block_metrics(laps, has_workout, hr_series, steps)
 
     # Garmin's session totals include phantom laps and any dropped lengths.
@@ -928,6 +943,23 @@ def render(group, merges=None, drops=None):
                       if l["is_active"] and not l["phantom"])
     pace100 = pace_per_100m(active_time, total_dist)
 
+    # v3.5 스트로크 신뢰도 — 거리·시간·HR·pace는 오염되지 않았으므로 전량
+    # 포함하고, 스트로크 파생 4종(avg_swolf·dps_m·cycles_per_length·spi)만
+    # 제외 모집단으로 산출한다. 플래그가 없으면 기존 값을 그대로 쓴다 —
+    # 랩 합산으로 갈아타면 Garmin 세션 집계와 미세하게 갈려 무플래그 세션의
+    # 출력이 바뀐다.
+    strokes_excluded_n = 0
+    swolf_time, swolf_cycles = active_time, total_cycles
+    swolf_lengths, dps_dist = act_lengths, total_dist
+    if unreliable_detail is not None:
+        clean = [l for l in laps if l["is_active"] and not l["phantom"]]
+        strokes_excluded_n = sum(len(l.get("unreliable", [])) for l in clean)
+        swolf_time = sum(l.get("sc_secs", l["secs"]) for l in clean)
+        swolf_cycles = sum(l.get("sc_cycles", l["cycles"]) for l in clean)
+        swolf_lengths = sum(l.get("sc_lengths", l["active_lengths"])
+                            for l in clean)
+        dps_dist = sum(l.get("sc_dist", l["dist"]) for l in clean)
+
     lines = []
     lines.append(f"schema_version: {SCHEMA_VERSION} | parser_tag: {PARSER_TAG}")
     lines.append("")
@@ -946,6 +978,15 @@ def render(group, merges=None, drops=None):
     if merge_note:
         lines.append(f"- merge_applied: true  (--merge {merge_note} — "
                      f"USER GATE 승인분, 폴백 경로)")
+    if unreliable_detail:
+        marks = " · ".join(
+            "랩{0}(length {1})".format(n, ",".join(str(i) for i in idxs))
+            for n, idxs in unreliable_detail)
+        lines.append(f"- strokes_unreliable: true  (--strokes-unreliable "
+                     f"{unreliable_note} — USER GATE 승인분, 값 미변경)")
+        lines.append(f"- strokes_excluded_n: {strokes_excluded_n}  ({marks} — "
+                     f"avg_swolf·dps_m·cycles_per_length·spi에서만 제외 · "
+                     f"거리·시간·HR은 전량 포함)")
     lines.append(f"- start_kst: {start_kst:%Y-%m-%d %H:%M}" if start_kst else "")
     if len(wkt_names) > 1:
         lines.append(f"- wkt_name: {', '.join(repr(w) for w in wkt_names)}"
@@ -966,13 +1007,18 @@ def render(group, merges=None, drops=None):
                  f"(경과 · 휴식 포함) | active_min: {round(active_time / 60, 1)}")
     lines.append(f"- avg_pace_per_100m: {round(pace100)}  ({fmt_pace(pace100)})"
                  if pace100 else "- avg_pace_per_100m: -")
-    sess_swolf = derived_swolf(active_time, total_cycles, act_lengths)
-    lines.append(f"- avg_swolf: {round(sess_swolf, 1)}" if sess_swolf
+    sess_swolf = derived_swolf(swolf_time, swolf_cycles, swolf_lengths)
+    sc_note = (f"  (스트로크 신뢰 length {swolf_lengths}개 기준)"
+               if strokes_excluded_n else "")
+    lines.append(f"- avg_swolf: {round(sess_swolf, 1)}{sc_note}" if sess_swolf
                  else "- avg_swolf: -")
     lines.append(f"- total_cycles: {total_cycles} | num_active_lengths: {act_lengths}")
     lines.append(f"- cycles_per_length: "
-                 f"{round(total_cycles / act_lengths, 2) if act_lengths else '-'}")
-    lines.append(f"- dps_m: {round(total_dist / total_cycles, 2) if total_cycles else '-'}")
+                 f"{round(swolf_cycles / swolf_lengths, 2) if swolf_lengths else '-'}"
+                 f"{sc_note}")
+    lines.append(f"- dps_m: "
+                 f"{round(dps_dist / swolf_cycles, 2) if swolf_cycles else '-'}"
+                 f"{sc_note}")
     lines.append(f"- avg_hr: {avg_hr} | peak_hr: {peak_hr}")
     lines.append(f"- hr_efficiency: {hr_efficiency(pace100, avg_hr)}")
     lines.append(f"- water_temp_c: {temp}")
@@ -1138,6 +1184,68 @@ def apply_drops(laps, drop, pool_length):
     return [l for l in laps if l["is_active"] or not l.get("dropped")]
 
 
+def parse_unreliable_arg(spec):
+    """`--strokes-unreliable 9,12` -> {9, 12} (length message indices)."""
+    out = set()
+    for chunk in spec.replace(" ", "").split(","):
+        if not chunk:
+            continue
+        try:
+            out.add(int(chunk))
+        except ValueError:
+            sys.exit(f"--strokes-unreliable: '{chunk}' 파싱 불가 (형식: 9,12)")
+    return out
+
+
+def apply_strokes_unreliable(laps, flagged, pool_length):
+    """v3.5: 스트로크를 믿을 수 없는 length에 표시만 한다 — 값은 고치지 않는다.
+
+    검출기(F1·F3)는 "스트로크가 이상하다"까지만 말하고 **센서 오검출인지
+    실제 이상 스트로크인지 구분하지 못한다.** 그래서 파서는 스스로 이 표시를
+    세우지 않는다 — 인자로 받은 것만 적용하며, 인자가 없으면 아무 것도 하지
+    않는다. 판정 주체는 사용자이고 경로는 다른 교정과 같은 GATE다.
+
+    `--drop-lengths`가 부적합한 이유 = 거리와 시간은 정확한데 스트로크만
+    의심스러운 상황에서 length를 통째로 버리면 멀쩡한 정보를 파괴한다.
+    스트로크 수 수동 덮어쓰기는 측정값 저작이므로 기각됐다.
+
+    하류 규약 — 스트로크 파생 지표(avg_swolf · dps_m · cycles_per_length ·
+    spi)만 표시된 length를 빼고 산출한다. 거리·시간·HR 집계는 전량 포함한다;
+    그 값들은 오염되지 않았다.
+
+    SWOLF는 length당 (시간 + 스트로크)이므로 시간도 함께 빼야 한다 — 스트로크만
+    빼고 시간을 남기면 남은 length에 없는 시간이 얹힌다. 같은 이유로 dps_m의
+    분자에서 그 length의 거리를 뺀다.
+
+    반환 = [(랩 번호, [length idx...]), ...] — 방출용 감사 자료.
+    """
+    if not pool_length:
+        sys.exit("--strokes-unreliable: pool_length 미상으로 거리 보정 불가")
+    seen, detail = set(), []
+    for lap in laps:
+        bad = [ln for ln in lap["lengths"]
+               if ln["idx"] in flagged and ln["type"] == "active"]
+        if not bad:
+            continue
+        seen.update(ln["idx"] for ln in bad)
+        strokes = sum(ln["strokes"] or 0 for ln in bad)
+        secs = sum(ln["secs"] or 0 for ln in bad)
+        lap["unreliable"] = sorted(ln["idx"] for ln in bad)
+        lap["sc_lengths"] = max(lap["active_lengths"] - len(bad), 0)
+        lap["sc_cycles"] = max(lap["cycles"] - strokes, 0)
+        lap["sc_secs"] = max(lap["secs"] - secs, 0.0)
+        lap["sc_dist"] = max(lap["dist"] - len(bad) * pool_length, 0.0)
+        lap["dswolf"] = derived_swolf(lap["sc_secs"], lap["sc_cycles"],
+                                      lap["sc_lengths"])
+        lap["dps"] = ((lap["sc_dist"] / lap["sc_cycles"])
+                      if lap["sc_cycles"] else None)
+        detail.append((lap["n"], lap["unreliable"]))
+    missing = flagged - seen
+    if missing:
+        sys.exit(f"--strokes-unreliable: active length {sorted(missing)} 없음")
+    return detail
+
+
 def parse_merge_arg(spec):
     """`--merge 14+15,20+21` -> [[14,15],[20,21]] (lap numbers as printed)."""
     pairs = []
@@ -1202,23 +1310,29 @@ def main(argv):
 
     merge_spec = None
     drop_spec = None
+    unreliable_spec = None
     paths = []
     i = 0
     while i < len(argv):
         a = argv[i]
-        if a in ("--merge", "--drop-lengths"):
+        if a in ("--merge", "--drop-lengths", "--strokes-unreliable"):
             if i + 1 >= len(argv):
                 sys.exit(f"{a}: 인자 필요")
             if a == "--merge":
                 merge_spec = argv[i + 1]
-            else:
+            elif a == "--drop-lengths":
                 drop_spec = argv[i + 1]
+            else:
+                unreliable_spec = argv[i + 1]
             i += 2
         elif a.startswith("--merge="):
             merge_spec = a.split("=", 1)[1]
             i += 1
         elif a.startswith("--drop-lengths="):
             drop_spec = a.split("=", 1)[1]
+            i += 1
+        elif a.startswith("--strokes-unreliable="):
+            unreliable_spec = a.split("=", 1)[1]
             i += 1
         else:
             paths.append(a)
@@ -1228,15 +1342,17 @@ def main(argv):
 
     merges = parse_merge_arg(merge_spec) if merge_spec else None
     drops = parse_drop_arg(drop_spec) if drop_spec else None
+    unreliable = (parse_unreliable_arg(unreliable_spec)
+                  if unreliable_spec else None)
     files = [read_fit(p) for p in paths]
     groups = group_sessions(files)
-    if (merges or drops) and len(groups) > 1:
-        sys.exit("--merge/--drop-lengths는 단일 세션에만 적용 가능하다 "
-                 f"(현재 {len(groups)}개 세션 검출)")
+    if (merges or drops or unreliable) and len(groups) > 1:
+        sys.exit("--merge/--drop-lengths/--strokes-unreliable는 단일 세션에만 "
+                 f"적용 가능하다 (현재 {len(groups)}개 세션 검출)")
     for i, group in enumerate(groups):
         if i:
             print("\n" + "=" * 72 + "\n")
-        print(render(group, merges, drops))
+        print(render(group, merges, drops, unreliable))
 
 
 def _cli():

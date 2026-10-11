@@ -21,10 +21,16 @@ Usage:
 
 Multiple paths are assembled into one session (Stage 0) when they are
 adjacent in time; otherwise each group is reported separately.
+
+Corrections (USER GATE only): --drop-lengths · --merge · --strokes-unreliable.
+In an assembled session name the file as F:IDX (F = the header file map,
+start-time order), e.g. `--drop-lengths 1:3,2:25`. A bare index found in
+more than one file is refused.
 """
 
 import bisect
 import json
+import os
 import statistics
 import sys
 from collections import Counter
@@ -35,8 +41,8 @@ try:
 except ImportError:  # pragma: no cover
     sys.exit("fitparse is required:  pip install fitparse")
 
-SCHEMA_VERSION = "3.5"
-PARSER_TAG = "v3.5"
+SCHEMA_VERSION = "3.6"
+PARSER_TAG = "v3.6"
 
 # block_metrics payload marker — see the emit site for why this is mandatory.
 BM_PREFIX = "bm1|"
@@ -212,9 +218,15 @@ def fade_pct(values):
 # --------------------------------------------------------------------------
 
 def build_laps(group):
-    """Flatten laps across the assembled files, attaching length-derived data."""
+    """Flatten laps across the assembled files, attaching length-derived data.
+
+    `f` = the file's 1-based position in the Stage 0 group, which
+    group_sessions() orders by start time — the F of the `F:IDX` correction
+    syntax. Length message indices restart in every file, so (f, idx) is the
+    only session-unique address of a length.
+    """
     laps = []
-    for f in group:
+    for fno, f in enumerate(group, 1):
         lengths = f["lengths"]
         for d in f["laps"]:
             dist = d.get("total_distance") or 0.0
@@ -247,6 +259,7 @@ def build_laps(group):
                 # files each carry their own step 2, so the group key must be
                 # scoped by source or the medians pool unrelated efforts.
                 "src": f["path"],
+                "f": fno,
                 "lap_n": None,
             } for x in window]
 
@@ -261,6 +274,7 @@ def build_laps(group):
             laps.append({
                 "lengths": lap_lengths,
                 "src": f["path"],
+                "f": fno,
                 "start": d.get("start_time"),
                 "step_idx": d.get("wkt_step_index"),
                 "dist": dist,
@@ -331,18 +345,41 @@ def group_blocks(laps, has_workout):
     # step can be reused by the watch for different content (observed 07-25,
     # where step 2 covers both a drill and a freestyle rep), and merging those
     # would pool physically different efforts under one signature.
+    #
+    # v3.6: the source file is part of the key — a block never crosses a file
+    # boundary. Without it an assembled session pooled reps recorded in
+    # different files at different times under one signature (10-11: the
+    # warm-up file's last 50 and the two post-routine 50s of the threshold
+    # file became one `50자유×3@r1:00`), and a step index — unique only
+    # within its file — joined unrelated steps of two programs. Single-file
+    # sessions carry one file, so their partition is unchanged.
     merged, order = {}, []
     for i, lap in active:
         kind = "step" if (has_workout and lap["step_idx"] is not None) else (
             "extra" if has_workout else "free")
         key = (kind, lap["step_idx"] if kind == "step" else None,
-               round(lap["dist"]), lap["stroke"])
+               round(lap["dist"]), lap["stroke"], lap.get("f"))
         if key not in merged:
             merged[key] = []
             order.append(key)
         merged[key].append((i, lap))
     # order is first-appearance chronological; repeats rejoin their own block
     return [(k, merged[k]) for k in order]
+
+
+def active_follows_in_file(laps, idx):
+    """Is there an active lap after laps[idx] in the SAME file?
+
+    v3.6: a file's last active lap is treated like the session's last one.
+    Assembled files are sequential in time, so without this rest_after()
+    summed the first file's trailing idle with the next file's leading idle
+    into a recovery window that never existed — the unrecorded gap between
+    the files is in neither (10-11 lap 8: 91 s, against a real gap of
+    ~10 min). A block does not cross a file boundary; neither does the
+    window that follows it. Single-file sessions: identical to v3.5.
+    """
+    f = laps[idx].get("f")
+    return any(l["is_active"] for l in laps[idx + 1:] if l.get("f") == f)
 
 
 def hrr_60(laps, idx, hr_series):
@@ -355,7 +392,7 @@ def hrr_60(laps, idx, hr_series):
     """
     # The last active lap of the session has no following rest window — the
     # trailing idle is session teardown, not recovery between efforts.
-    if not any(l["is_active"] for l in laps[idx + 1:]):
+    if not active_follows_in_file(laps, idx):
         return None
     rest = rest_after(laps, idx)
     if rest is None or rest < HRR_MIN_REST_S:
@@ -416,7 +453,7 @@ def build_block_metrics(laps, has_workout, hr_series, steps):
         # rest_median_s (which is rest BETWEEN reps). Emitting it makes an
         # hrr_60 value auditable instead of having to trust the gate.
         hrr_rest = rest_after(laps, idxs[-1])
-        if not any(l["is_active"] for l in laps[idxs[-1] + 1:]):
+        if not active_follows_in_file(laps, idxs[-1]):
             hrr_rest = None
 
         # Garmin does not count strokes on drill lengths, so total_cycles==0
@@ -470,7 +507,7 @@ def declared_stroke(steps, step_idx):
     return step.get("target_stroke_type")
 
 
-def collect_flags(laps, lengths, steps, blocks, pool_length=None):
+def collect_flags(laps, lengths, steps, blocks, pool_length=None, multi=False):
     """v3.0 detection rules F1~F4 (Schema: 병합 서브루틴 절).
 
     Detection descends from lap to length. In FIT each active length is exactly
@@ -481,6 +518,10 @@ def collect_flags(laps, lengths, steps, blocks, pool_length=None):
 
     Detection only. Cause attribution belongs to P1 문진; merging happens via
     --merge after USER GATE.
+
+    `multi` = the session was assembled from several files. Proposals then
+    name the file (`F:IDX`): a bare index may exist in more than one file,
+    and the parser refuses an ambiguous bare index — it must not propose one.
     """
     flags = []
 
@@ -572,6 +613,8 @@ def collect_flags(laps, lengths, steps, blocks, pool_length=None):
             continue
         gnote = (f"| 그룹 {label}, n={len(strokes)}, "
                  f"기준선 {s_base:.1f}({base_note})")
+        # the group key carries the source file, so one prefix fits all
+        fpre = f"{group[0].get('f')}:" if multi else ""
 
         # per-length ratios; strokes primary, duration secondary
         for ln in group:
@@ -649,7 +692,7 @@ def collect_flags(laps, lengths, steps, blocks, pool_length=None):
                 # the surplus candidates themselves are what to drop
                 drop_idx = list(c1["cands"])
                 proposal = "--drop-lengths " + ",".join(
-                    str(d) for d in drop_idx)
+                    f"{fpre}{d}" for d in drop_idx)
                 design = (
                     f"C1 설계 대조 — 실측 {c1['observed']} length vs 설계 "
                     f"{c1['dd']:.0f}m ÷ {pool_length:.0f}m = {c1['designed']} "
@@ -671,7 +714,7 @@ def collect_flags(laps, lengths, steps, blocks, pool_length=None):
                                  if x["stroke"] == declared), run[0])
                 drop_idx = [x["idx"] for x in run if x["idx"] != host["idx"]]
                 proposal = "--drop-lengths " + ",".join(
-                    str(d) for d in drop_idx)
+                    f"{fpre}{d}" for d in drop_idx)
                 # Second evidence line: does the corrected lap distance match
                 # the programmed step distance? Deterministic when present.
                 owner = next((l for l in laps if l["n"] == run[0]["lap_n"]), None)
@@ -890,6 +933,15 @@ def render(group, merges=None, drops=None, unreliable=None):
     hr_series.sort()
 
     laps = build_laps(group)
+    multi = len(group) > 1
+    # v3.6: correction arguments arrive as [(F or None, idx)] and are pinned
+    # to (file, idx) here, before anything is applied — see resolve_lengths.
+    if drops:
+        drops = resolve_lengths(drops, group, "--drop-lengths")
+    if unreliable:
+        unreliable = resolve_lengths(unreliable, group, "--strokes-unreliable")
+    if merges:
+        merges = resolve_merges(merges, laps, group)
     merge_note = None
     drop_note = None
     if drops:
@@ -897,7 +949,7 @@ def render(group, merges=None, drops=None, unreliable=None):
         # already-corrected lengths.
         garmin_dist_pre = sum(l["dist"] for l in laps if l["is_active"])
         laps = apply_drops(laps, drops, sess.get("pool_length"))
-        drop_note = ",".join(str(d) for d in sorted(drops))
+        drop_note = fmt_length_refs(drops, multi)
     if merges:
         laps = apply_merges(laps, merges)
         merge_note = ", ".join("+".join(str(m) for m in p) for p in merges)
@@ -908,7 +960,7 @@ def render(group, merges=None, drops=None, unreliable=None):
     if unreliable:
         unreliable_detail = apply_strokes_unreliable(
             laps, unreliable, sess.get("pool_length"))
-        unreliable_note = ",".join(str(i) for i in sorted(unreliable))
+        unreliable_note = fmt_length_refs(unreliable, multi)
     blocks = build_block_metrics(laps, has_workout, hr_series, steps)
 
     # Garmin's session totals include phantom laps and any dropped lengths.
@@ -966,6 +1018,16 @@ def render(group, merges=None, drops=None, unreliable=None):
     lines.append(f"## Swim {start_kst:%Y-%m-%d}" if start_kst else "## Swim")
     lines.append(f"- files: {len(group)}" +
                  ("  (Stage 0 assembled)" if len(group) > 1 else ""))
+    if multi:
+        # v3.6 file map — the F of `F:IDX`. Printed before anything else so
+        # P1 can read it before writing a correction argument. Single-file
+        # output stays byte-identical to v3.5, hence multi only.
+        lines.append("- file_map: F = Stage 0 조립 순서(시작 시각 오름차순) — "
+                     "교정 인자 `F:IDX`의 F")
+        for fno, f in enumerate(group, 1):
+            st = f["session"].get("start_time")
+            lines.append(f"  - F{fno} = {os.path.basename(f['path'])} "
+                         f"({(st + KST):%Y-%m-%d %H:%M:%S} KST)")
     if drop_note:
         lines.append(f"- merge_applied: true  (--drop-lengths {drop_note} — "
                      f"USER GATE 승인분, 거리 = 잔여 active length × "
@@ -1057,7 +1119,7 @@ def render(group, merges=None, drops=None, unreliable=None):
 
     all_lengths = [ln for lap in laps for ln in lap["lengths"]]
     flags = collect_flags(laps, all_lengths, steps, blocks,
-                          sess.get("pool_length"))
+                          sess.get("pool_length"), multi)
     lines.append("")
     lines.append("### 검출 플래그")
     if not flags:
@@ -1102,17 +1164,116 @@ def render(group, merges=None, drops=None, unreliable=None):
     return "\n".join(l for l in lines if l is not None)
 
 
+def _parse_ref(chunk, opt, example):
+    """One correction reference: `IDX` -> int, `F:IDX` -> (F, IDX).
+
+    v3.6. A bare int stays an int — the "file not named" marker that
+    resolve_lengths()/resolve_merges() pin to a file or refuse. F is the
+    file's position in the Stage 0 group (start-time order), 1-based.
+    """
+    try:
+        if ":" in chunk:
+            f, idx = chunk.split(":", 1)
+            f, idx = int(f), int(idx)
+            if f < 1:
+                raise ValueError
+            return (f, idx)
+        return int(chunk)
+    except ValueError:
+        sys.exit(f"{opt}: '{chunk}' 파싱 불가 (형식: {example})")
+
+
 def parse_drop_arg(spec):
-    """`--drop-lengths 35,36,37` -> {35, 36, 37} (length message indices)."""
+    """`--drop-lengths 35,36,37` -> {35, 36, 37} (length message indices).
+    `--drop-lengths 1:3,2:25` -> {(1, 3), (2, 25)} (v3.6, file named)."""
     out = set()
     for chunk in spec.replace(" ", "").split(","):
         if not chunk:
             continue
-        try:
-            out.add(int(chunk))
-        except ValueError:
-            sys.exit(f"--drop-lengths: '{chunk}' 파싱 불가 (형식: 35,36,37)")
+        out.add(_parse_ref(chunk, "--drop-lengths", "35,36,37 또는 1:3,2:25"))
     return out
+
+
+def _fname(f):
+    return os.path.basename(f["path"])
+
+
+def resolve_lengths(refs, group, opt):
+    """v3.6 (Q-014): pin every length reference to (file, idx).
+
+    Length message indices restart in every file. Until v3.5 a bare index
+    hit that index in EVERY assembled file — 10-11 `--drop-lengths 3` meant
+    for the warm-up file also cut a length out of the threshold file's
+    300 warm-up, silently. So:
+
+      - `F:IDX`               -> taken as given (F must exist)
+      - bare, single file      -> (1, IDX)        — v3.5 behaviour
+      - bare, in ONE file only -> (that file, IDX) — past parse_args replay
+      - bare, in 2+ files      -> refused, naming the files. Picking one
+        quietly is exactly the failure this replaces.
+      - bare, in no file       -> refused
+
+    Whether the index exists in the named file is left to the apply_*
+    functions, which already refuse a missing length.
+    """
+    multi = len(group) > 1
+    idx_sets = [{x.get("message_index") for x in f["lengths"]} for f in group]
+    out = set()
+    for ref in sorted(refs, key=lambda r: r if isinstance(r, tuple) else (0, r)):
+        if isinstance(ref, tuple):
+            f, idx = ref
+            if not 1 <= f <= len(group):
+                sys.exit(f"{opt}: '{f}:{idx}' — 파일 F{f} 없음 "
+                         f"(이 세션은 F1~F{len(group)})")
+            out.add((f, idx))
+            continue
+        if not multi:
+            out.add((1, ref))
+            continue
+        owners = [fno for fno, s in enumerate(idx_sets, 1) if ref in s]
+        if len(owners) == 1:
+            out.add((owners[0], ref))
+        elif not owners:
+            sys.exit(f"{opt}: length #{ref} 없음 (어느 파일에도 없다)")
+        else:
+            where = " · ".join(f"F{fno}({_fname(group[fno - 1])})"
+                               for fno in owners)
+            sys.exit(f"{opt}: length #{ref}가 여러 파일에 존재한다 — {where}. "
+                     f"파일을 지정하라: "
+                     + " 또는 ".join(f"{fno}:{ref}" for fno in owners))
+    return out
+
+
+def fmt_length_refs(refs, multi):
+    """Header note. Single file keeps the v3.5 form (`35,36,37`) byte for
+    byte; an assembled session prints the resolved `F:IDX`, so a bare index
+    the parser pinned to a file is visible as such."""
+    if multi:
+        return ",".join(f"{f}:{i}" for f, i in sorted(refs))
+    return ",".join(str(i) for _, i in sorted(refs))
+
+
+def _ref_hit(ln, refs):
+    """A length matches a resolved (file, idx) reference — or, for library
+    callers passing plain ints (the pre-3.6 API), any length with that idx."""
+    return (ln.get("f"), ln["idx"]) in refs or ln["idx"] in refs
+
+
+def _missing_refs(refs, seen):
+    """refs not matched by any length; `seen` holds (f, idx) pairs."""
+    seen_idx = {i for _, i in seen}
+    return sorted((r for r in refs
+                   if (r not in seen if isinstance(r, tuple)
+                       else r not in seen_idx)),
+                  key=lambda r: r if isinstance(r, tuple) else (0, r))
+
+
+def _fmt_missing(missing, laps):
+    """Single-file sessions keep the v3.5 message (`[35]`)."""
+    if len({l.get("f") for l in laps}) > 1:
+        return "[" + ", ".join(f"{r[0]}:{r[1]}" if isinstance(r, tuple)
+                               else str(r) for r in missing) + "]"
+    return str([r[1] if isinstance(r, tuple) else r for r in missing])
 
 
 def apply_drops(laps, drop, pool_length):
@@ -1131,11 +1292,11 @@ def apply_drops(laps, drop, pool_length):
         sys.exit("--drop-lengths: pool_length 미상으로 거리 재산출 불가")
     seen = set()
     for lap in laps:
-        keep = [ln for ln in lap["lengths"] if ln["idx"] not in drop]
-        removed = [ln for ln in lap["lengths"] if ln["idx"] in drop]
+        keep = [ln for ln in lap["lengths"] if not _ref_hit(ln, drop)]
+        removed = [ln for ln in lap["lengths"] if _ref_hit(ln, drop)]
         if not removed:
             continue
-        seen.update(ln["idx"] for ln in removed)
+        seen.update((ln.get("f"), ln["idx"]) for ln in removed)
         # absorb each removed length into the closest earlier survivor
         # (falling back to the first survivor when it led the run)
         for ln in removed:
@@ -1178,22 +1339,20 @@ def apply_drops(laps, drop, pool_length):
             if len(survivors) == 1:
                 lap["stroke"] = survivors.pop()
                 lap["relabeled"] = True
-    missing = drop - seen
+    missing = _missing_refs(drop, seen)
     if missing:
-        sys.exit(f"--drop-lengths: length {sorted(missing)} 없음")
+        sys.exit(f"--drop-lengths: length {_fmt_missing(missing, laps)} 없음")
     return [l for l in laps if l["is_active"] or not l.get("dropped")]
 
 
 def parse_unreliable_arg(spec):
-    """`--strokes-unreliable 9,12` -> {9, 12} (length message indices)."""
+    """`--strokes-unreliable 9,12` -> {9, 12} (length message indices).
+    `--strokes-unreliable 2:9` -> {(2, 9)} (v3.6, file named)."""
     out = set()
     for chunk in spec.replace(" ", "").split(","):
         if not chunk:
             continue
-        try:
-            out.add(int(chunk))
-        except ValueError:
-            sys.exit(f"--strokes-unreliable: '{chunk}' 파싱 불가 (형식: 9,12)")
+        out.add(_parse_ref(chunk, "--strokes-unreliable", "9,12 또는 2:9"))
     return out
 
 
@@ -1224,10 +1383,10 @@ def apply_strokes_unreliable(laps, flagged, pool_length):
     seen, detail = set(), []
     for lap in laps:
         bad = [ln for ln in lap["lengths"]
-               if ln["idx"] in flagged and ln["type"] == "active"]
+               if _ref_hit(ln, flagged) and ln["type"] == "active"]
         if not bad:
             continue
-        seen.update(ln["idx"] for ln in bad)
+        seen.update((ln.get("f"), ln["idx"]) for ln in bad)
         strokes = sum(ln["strokes"] or 0 for ln in bad)
         secs = sum(ln["secs"] or 0 for ln in bad)
         lap["unreliable"] = sorted(ln["idx"] for ln in bad)
@@ -1240,27 +1399,56 @@ def apply_strokes_unreliable(laps, flagged, pool_length):
         lap["dps"] = ((lap["sc_dist"] / lap["sc_cycles"])
                       if lap["sc_cycles"] else None)
         detail.append((lap["n"], lap["unreliable"]))
-    missing = flagged - seen
+    missing = _missing_refs(flagged, seen)
     if missing:
-        sys.exit(f"--strokes-unreliable: active length {sorted(missing)} 없음")
+        sys.exit(f"--strokes-unreliable: active length "
+                 f"{_fmt_missing(missing, laps)} 없음")
     return detail
 
 
 def parse_merge_arg(spec):
-    """`--merge 14+15,20+21` -> [[14,15],[20,21]] (lap numbers as printed)."""
+    """`--merge 14+15,20+21` -> [[14,15],[20,21]] (lap numbers as printed).
+    `--merge 2:14+2:15` -> [[(2,14),(2,15)]] (v3.6, file named)."""
     pairs = []
     for chunk in spec.split(","):
         chunk = chunk.strip()
         if not chunk:
             continue
-        try:
-            members = [int(x) for x in chunk.split("+")]
-        except ValueError:
-            sys.exit(f"--merge: '{chunk}' 파싱 불가 (형식: 14+15,20+21)")
+        members = [_parse_ref(x.strip(), "--merge", "14+15,20+21 또는 2:14+2:15")
+                   for x in chunk.split("+")]
         if len(members) < 2:
             sys.exit(f"--merge: '{chunk}'는 2개 이상의 랩이 필요하다")
         pairs.append(members)
     return pairs
+
+
+def resolve_merges(pairs, laps, group):
+    """v3.6: `--merge` members -> lap numbers.
+
+    Unlike length indices, lap numbers are already session-unique — they
+    are assigned after the assembled files are flattened and sorted — so a
+    bare lap number is never ambiguous and passes unchanged. `F:N` is
+    accepted for a uniform syntax and checked: lap N must belong to file F,
+    otherwise the argument was written against the wrong file and is
+    refused rather than applied.
+    """
+    owner = {l["n"]: l.get("f") for l in laps}
+    out = []
+    for members in pairs:
+        row = []
+        for m in members:
+            if isinstance(m, tuple):
+                f, n = m
+                if not 1 <= f <= len(group):
+                    sys.exit(f"--merge: '{f}:{n}' — 파일 F{f} 없음 "
+                             f"(이 세션은 F1~F{len(group)})")
+                if n in owner and owner[n] != f:
+                    sys.exit(f"--merge: '{f}:{n}' — 랩 {n}은 F{owner[n]}"
+                             f"({_fname(group[owner[n] - 1])})의 랩이다")
+                m = n
+            row.append(m)
+        out.append(row)
+    return out
 
 
 def apply_merges(laps, pairs):

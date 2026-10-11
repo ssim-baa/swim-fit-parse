@@ -160,7 +160,7 @@ def preflight(env, run_tests=True, from_tag=False, need_token=True):
           "커밋 이력에 들어갔다면 토큰을 즉시 폐기하라")
 
     if run_tests:
-        for name in ("test_v34.py", "test_v35.py"):
+        for name in ("test_v34.py", "test_v35.py", "test_v36.py"):
             path = os.path.join("tests", name)
             if not os.path.exists(os.path.join(REPO, path)):
                 continue
